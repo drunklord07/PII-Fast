@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+import os
+import re
+import shutil
+from multiprocessing import Pool, cpu_count, Manager
+from docx import Document
+from docx.shared import RGBColor
+import xlsxwriter
+from tqdm import tqdm
+
+# === CONFIG ===
+CHUNK_SIZE    = 2000
+INPUT_FILE    = "input.txt"
+# Keyword list for Address
+KEYWORDS      = [
+    "address", "full address", "complete address",
+    "residential address", "permanent address",
+    "locality", "pincode", "postal code",
+    "zip", "zip code", "city", "state"
+]
+OUTPUT_DOCX   = "output_address.docx"
+OUTPUT_XLSX   = "output_address.xlsx"
+TEMP_DIR      = "temp_parts"
+
+def compile_patterns():
+    """Turn each keyword into a regex that allows flexible spacing/delimiters."""
+    pats = []
+    for kw in KEYWORDS:
+        # escape and replace spaces with [\s._-]*
+        esc = re.escape(kw).replace(r"\ ", r"[\s._-]*")
+        pats.append(re.compile(esc, re.IGNORECASE))
+    return pats
+
+def split_file():
+    if os.path.isdir(TEMP_DIR):
+        shutil.rmtree(TEMP_DIR)
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    total = sum(1 for _ in open(INPUT_FILE, 'r', encoding='utf-8', errors='ignore'))
+    with open(INPUT_FILE, 'r', encoding='utf-8', errors='ignore') as f, \
+         tqdm(total=total, desc="Splitting lines", unit="line") as bar:
+        buf, part = [], 0
+        for i, line in enumerate(f, 1):
+            buf.append(line)
+            if i % CHUNK_SIZE == 0:
+                chunk = os.path.join(TEMP_DIR, f"chunk_{part}.txt")
+                with open(chunk, 'w', encoding='utf-8') as out:
+                    out.writelines(buf)
+                buf, part = [], part + 1
+            bar.update(1)
+        if buf:
+            chunk = os.path.join(TEMP_DIR, f"chunk_{part}.txt")
+            with open(chunk, 'w', encoding='utf-8') as out:
+                out.writelines(buf)
+
+def process_chunk(args):
+    chunk_path, results = args
+    patterns = compile_patterns()
+    doc = Document()
+    data = []
+    with open(chunk_path, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            txt = line.rstrip('\n')
+            spans = []
+            matches = []
+            for pat in patterns:
+                for m in pat.finditer(txt):
+                    spans.append(m.span())
+                    matches.append(m.group())
+            if not matches:
+                continue
+            # Word: highlight each occurrence
+            para, last = doc.add_paragraph(), 0
+            for (s, e), match in zip(spans, matches):
+                if s > last:
+                    para.add_run(txt[last:s])
+                run = para.add_run(txt[s:e])
+                run.font.color.rgb = RGBColor(255, 0, 0)
+                last = e
+            if last < len(txt):
+                para.add_run(txt[last:])
+            # Collect for Excel
+            for match in matches:
+                data.append((match, txt, spans))
+    part_id = os.path.basename(chunk_path).split('_')[-1].split('.')[0]
+    doc.save(os.path.join(TEMP_DIR, f"chunk_{part_id}.docx"))
+    results.append(data)
+
+def merge_word():
+    merged = Document()
+    for fn in sorted(os.listdir(TEMP_DIR)):
+        if fn.endswith('.docx'):
+            sub = Document(os.path.join(TEMP_DIR, fn))
+            for p in sub.paragraphs:
+                merged.add_paragraph(p.text)
+    merged.save(OUTPUT_DOCX)
+
+def write_excel(all_data):
+    wb = xlsxwriter.Workbook(OUTPUT_XLSX)
+    ws = wb.add_worksheet()
+    red = wb.add_format({'font_color':'red'})
+    # Headers
+    ws.write(0, 0, "Keyword")
+    ws.write(0, 1, "Full Line")
+    for r, (kw, line, spans) in enumerate(tqdm(all_data, desc="Writing Excel", unit="match"), start=1):
+        ws.write(r, 0, kw, red)
+        parts, last = [], 0
+        for s, e in spans:
+            if s > last:
+                parts.append(line[last:s])
+            parts += [red, line[s:e]]
+            last = e
+        if last < len(line):
+            parts.append(line[last:])
+        ws.write_rich_string(r, 1, *parts)
+    wb.close()
+
+def main():
+    print("=== ADDRESS KEYWORD EXTRACTOR ===")
+    split_file()
+    manager = Manager()
+    results = manager.list()
+    chunks = [(os.path.join(TEMP_DIR, f), results)
+              for f in os.listdir(TEMP_DIR) if f.endswith('.txt')]
+    with Pool(min(cpu_count(), len(chunks))) as pool:
+        list(tqdm(pool.imap_unordered(process_chunk, chunks),
+                  total=len(chunks), desc="Processing chunks"))
+    all_data = [item for sub in results for item in sub]
+    print(f"✅ Found {len(all_data)} address‐keyword matches.")
+    merge_word()
+    write_excel(all_data)
+    shutil.rmtree(TEMP_DIR)
+    print(f"Outputs written to {OUTPUT_DOCX} and {OUTPUT_XLSX}")
+
+if __name__ == '__main__':
+    main()
