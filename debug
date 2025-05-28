@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import shutil
 from multiprocessing import Pool, Manager, cpu_count
 from docx import Document
@@ -8,123 +9,123 @@ import xlsxwriter
 from tqdm import tqdm
 
 # === CONFIG ===
-CHUNK_SIZE    = 2000                # number of records per chunk
 INPUT_FILE    = "input.txt"
+CHUNK_SIZE    = 2000                    # number of records per parallel chunk
 EMAIL_REGEX   = r"\b[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b"
 OUTPUT_DOCX   = "output_email.docx"
 OUTPUT_XLSX   = "output_email.xlsx"
 TEMP_DIR      = "temp_parts"
+DEBUG_LOG     = "debug_no_email.log"
 
-# === SPLIT FILE INTO RECORD-BASED CHUNKS ===
-def split_file():
-    if os.path.exists(TEMP_DIR):
-        shutil.rmtree(TEMP_DIR)
-    os.makedirs(TEMP_DIR)
-
-    # read all lines, normalize Windows endings
-    with open(INPUT_FILE, 'r', encoding='utf-8', errors='ignore') as f:
-        raw = f.readlines()
-    lines = [ln.rstrip('\r\n') + '\n' for ln in raw]
-
-    # group into record-pairs
+# === RECORD PARSING ===
+def load_records():
+    """
+    Reads INPUT_FILE, normalizes line endings, and returns a list of tuples:
+      (identifier, timestamp, payload_text)
+    by detecting every line that starts with 'CreateTime:' and pairing it with
+    the most recent preceding non-empty line as its identifier.
+    """
     records = []
-    for i in range(0, len(lines), 2):
-        records.append(lines[i])
-        records.append(lines[i+1] if i+1 < len(lines) else "\n")
+    last_id = None
+    ct_re   = re.compile(r"^CreateTime:(\d+)\s+(.*)$")
+    with open(INPUT_FILE, 'r', encoding='utf-8', errors='ignore') as f:
+        for raw in f:
+            line = raw.rstrip('\r\n')
+            m = ct_re.match(line)
+            if m and last_id is not None:
+                ts      = m.group(1)
+                payload = m.group(2)
+                records.append((last_id, ts, payload))
+            elif line.strip():
+                last_id = line.strip()
+    return records
 
-    # write out chunks, CHUNK_SIZE records => 2*CHUNK_SIZE lines per chunk
-    recs_per_chunk = CHUNK_SIZE * 2
-    for idx in range(0, len(records), recs_per_chunk):
-        part = idx // recs_per_chunk
-        chunk = records[idx: idx + recs_per_chunk]
-        with open(os.path.join(TEMP_DIR, f"chunk_{part}.txt"), 'w', encoding='utf-8') as out:
-            out.writelines(chunk)
+# === CHUNK RECORD LISTS ===
+def chunk_records(records):
+    for i in range(0, len(records), CHUNK_SIZE):
+        yield records[i:i+CHUNK_SIZE], i // CHUNK_SIZE
 
 # === PROCESS ONE CHUNK ===
 def process_chunk(args):
-    chunk_path, result_list = args
+    chunk, idx, result_list = args
     pattern = re.compile(EMAIL_REGEX, re.IGNORECASE)
 
+    # Word doc for this chunk
     doc = Document()
     matches_data = []
-    total_recs = matched_recs = 0
+    recs_seen = recs_with_email = 0
 
-    with open(chunk_path, 'r', encoding='utf-8', errors='ignore') as f:
-        lines = f.readlines()
+    # open debug log for this worker
+    debug_f = open(DEBUG_LOG, 'a', encoding='utf-8')
 
-    # each record is two lines: identifier + payload
-    for i in range(0, len(lines), 2):
-        total_recs += 1
-        identifier = lines[i].rstrip('\r\n')
-        payload_line = lines[i+1].rstrip('\r\n') if i+1 < len(lines) else ""
-        m = re.match(r"^CreateTime:(\d+)\s+(.*)$", payload_line)
-        if not m:
-            continue
-        timestamp    = m.group(1)
-        payload_text = m.group(2)
-
-        # find email matches in the payload only
-        matches = list(pattern.finditer(payload_text))
+    for identifier, ts, payload in chunk:
+        recs_seen += 1
+        matches = list(pattern.finditer(payload))
         if not matches:
+            # log this payload for manual inspection
+            debug_f.write(f"NO EMAIL in record: {identifier} | CreateTime:{ts} | {payload}\n")
             continue
-        matched_recs += 1
+        recs_with_email += 1
 
-        # build Word paragraph: identifier | timestamp | payload with email in red
-        para = doc.add_paragraph(f"{identifier} | CreateTime:{timestamp} | ")
+        # parse JSON once for field lookup
+        try:
+            obj = json.loads(payload)
+        except json.JSONDecodeError:
+            obj = {}
+
+        # Word paragraph
+        para = doc.add_paragraph(f"{identifier} | CreateTime:{ts} | ")
         last = 0
         for mt in matches:
             s, e = mt.span()
             if s > last:
-                para.add_run(payload_text[last:s])
-            run = para.add_run(payload_text[s:e])
+                para.add_run(payload[last:s])
+            run = para.add_run(payload[s:e])
             run.font.color.rgb = RGBColor(255, 0, 0)
             last = e
-            # record for Excel
-            matches_data.append((identifier, timestamp, payload_text, mt.group()))
-        if last < len(payload_text):
-            para.add_run(payload_text[last:])
+            # collect for Excel
+            matches_data.append((identifier, ts, payload, mt.group()))
+        if last < len(payload):
+            para.add_run(payload[last:])
 
-        # save only first paragraph per record (multiple emails yield multiple Excel rows)
-        # Word will show all matches in one paragraph
+    debug_f.close()
 
-    # save chunk docx only if matches found
+    # save Word chunk if any matches
     if matches_data:
-        part_id = os.path.splitext(os.path.basename(chunk_path))[0].split('_')[-1]
-        doc.save(os.path.join(TEMP_DIR, f"chunk_{part_id}.docx"))
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        doc.save(os.path.join(TEMP_DIR, f"chunk_{idx}.docx"))
 
-    result_list.append((matches_data, total_recs, matched_recs))
+    result_list.append((matches_data, recs_seen, recs_with_email))
 
-# === MERGE WORD CHUNKS (preserve red runs) ===
+# === MERGE ALL WORD CHUNKS ===
 def merge_word():
     merged = Document()
-    files = sorted(f for f in os.listdir(TEMP_DIR) if f.endswith(".docx"))
-    with tqdm(total=len(files), desc="Merging Word files") as pbar:
-        for fn in files:
-            doc = Document(os.path.join(TEMP_DIR, fn))
-            for para in doc.paragraphs:
-                new_p = merged.add_paragraph()
-                for run in para.runs:
-                    nr = new_p.add_run(run.text)
-                    if run.font.color and run.font.color.rgb:
-                        nr.font.color.rgb = run.font.color.rgb
-                    nr.bold      = run.bold
-                    nr.italic    = run.italic
-                    nr.underline = run.underline
-            pbar.update(1)
+    part_files = sorted(f for f in os.listdir(TEMP_DIR) if f.endswith(".docx"))
+    for fn in tqdm(part_files, desc="Merging Word"):
+        doc = Document(os.path.join(TEMP_DIR, fn))
+        for para in doc.paragraphs:
+            new_p = merged.add_paragraph()
+            for run in para.runs:
+                nr = new_p.add_run(run.text)
+                if run.font.color and run.font.color.rgb:
+                    nr.font.color.rgb = run.font.color.rgb
+                nr.bold = run.bold
+                nr.italic = run.italic
+                nr.underline = run.underline
     merged.save(OUTPUT_DOCX)
 
 # === WRITE EXCEL ===
 def write_excel(all_matches):
     wb = xlsxwriter.Workbook(OUTPUT_XLSX)
     ws = wb.add_worksheet()
-    red = wb.add_format({'font_color': 'red'})
+    red = wb.add_format({'font_color':'red'})
 
-    # header row
+    # header
     ws.write_row(0, 0, ["Identifier","Timestamp","Payload","Email"])
     row = 1
-    for identifier, timestamp, payload, email in all_matches:
+    for identifier, ts, payload, email in all_matches:
         ws.write(row, 0, identifier)
-        ws.write(row, 1, timestamp)
+        ws.write(row, 1, ts)
         ws.write(row, 2, payload)
         ws.write(row, 3, email, red)
         row += 1
@@ -133,38 +134,52 @@ def write_excel(all_matches):
 
 # === MAIN ===
 if __name__ == "__main__":
-    print("=== EMAIL EXTRACTOR (Record-Based, Parallel) ===")
-    print("Regex used:", EMAIL_REGEX)
+    # cleanup old debug log and temp
+    if os.path.exists(DEBUG_LOG):
+        os.remove(DEBUG_LOG)
+    if os.path.isdir(TEMP_DIR):
+        shutil.rmtree(TEMP_DIR)
 
-    split_file()
+    print("=== EMAIL EXTRACTOR (Robust Record-Based) ===")
+    print("Regex:", EMAIL_REGEX)
 
-    print("\nProcessing chunks in parallel...")
+    # load and chunk
+    records = load_records()
+    print(f"Total records found: {len(records)}")
+    chunks  = list(chunk_records(records))
+
     manager = Manager()
     results = manager.list()
 
-    chunks = [os.path.join(TEMP_DIR, f) for f in os.listdir(TEMP_DIR) if f.endswith(".txt")]
-    with tqdm(total=len(chunks), desc="Chunks") as pbar, \
-         Pool(min(cpu_count(), len(chunks))) as pool:
-        for _ in pool.imap_unordered(process_chunk, [(c, results) for c in chunks]):
-            pbar.update(1)
+    # process in parallel
+    with Pool(min(cpu_count(), len(chunks))) as pool:
+        list(tqdm(pool.imap_unordered(process_chunk,
+                                      [ (chunk, idx, results)
+                                        for chunk, idx in chunks ]),
+                  total=len(chunks),
+                  desc="Processing chunks"))
 
-    # aggregate
-    all_matches       = []
-    total_records     = total_with_emails = 0
-    for matches_data, recs, matched in results:
+    # aggregate results
+    all_matches        = []
+    total_recs         = total_with_email = 0
+    for matches_data, recs, with_email in results:
         all_matches.extend(matches_data)
-        total_records     += recs
-        total_with_emails += matched
+        total_recs       += recs
+        total_with_email += with_email
 
-    print(f"\nRecords scanned       : {total_records}")
-    print(f"Records with emails   : {total_with_emails}")
-    print(f"Total email matches   : {len(all_matches)}")
+    print(f"\nRecords scanned     : {total_recs}")
+    print(f"Records with email  : {total_with_email}")
+    print(f"Total email matches : {len(all_matches)}")
 
-    merge_word()
+    # outputs
+    if os.path.isdir(TEMP_DIR):
+        merge_word()
     write_excel(all_matches)
 
-    print("\nCleaning up...")
-    shutil.rmtree(TEMP_DIR)
+    # cleanup
+    if os.path.isdir(TEMP_DIR):
+        shutil.rmtree(TEMP_DIR)
 
     print(f"\n→ Word saved to {OUTPUT_DOCX}")
     print(f"→ Excel saved to {OUTPUT_XLSX}")
+    print(f"→ Debug log at {DEBUG_LOG} for any no-email records.")
