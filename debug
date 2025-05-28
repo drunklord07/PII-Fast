@@ -11,30 +11,30 @@ from tqdm import tqdm
 # === CONFIG ===
 CHUNK_SIZE    = 2000
 INPUT_FILE    = "input.txt"
-# loose, case-insensitive, multi-TLD pattern
-EMAIL_REGEX   = r"\b[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b"
+# allow emails followed by ], }, comma or quote without swallowing them
+EMAIL_REGEX   = r"\b([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})(?=[\]\}\,\"\']|\b)"
 OUTPUT_DOCX   = "output_email.docx"
 OUTPUT_XLSX   = "output_email.xlsx"
 TEMP_DIR      = "temp_parts"
 
-# === RECURSIVE FIELD FINDER (unchanged) ===
+# === find_field (unchanged) ===
 def find_field(obj, val):
     if isinstance(obj, dict):
         for k, v in obj.items():
             if isinstance(v, list):
                 for item in v:
-                    if not isinstance(item, (dict, list)) and str(item) == val:
+                    if not isinstance(item, (dict, list)) and str(item)==val:
                         return [k]
                     sub = find_field(item, val)
                     if sub:
-                        return [k] + sub
+                        return [k]+sub
             elif isinstance(v, dict):
                 sub = find_field(v, val)
                 if sub:
-                    return [k] + sub
+                    return [k]+sub
             else:
                 s = str(v)
-                if s == val:
+                if s==val:
                     return [k]
                 if isinstance(v, str):
                     parts = [p.strip() for p in s.split(',')]
@@ -47,7 +47,7 @@ def find_field(obj, val):
                 return sub
     return None
 
-# === SPLIT INTO CHUNKS ===
+# === split into chunks ===
 def split_file():
     if os.path.exists(TEMP_DIR):
         shutil.rmtree(TEMP_DIR)
@@ -56,7 +56,7 @@ def split_file():
     with open(INPUT_FILE, 'r', encoding='utf-8', errors='ignore') as f:
         lines = f.readlines()
 
-    total_recs = (len(lines) + 1) // 2
+    total_recs = (len(lines) + 1)//2
     pbar = tqdm(total=total_recs, desc="Splitting file", unit="records")
     records = []
     for i in range(0, len(lines), 2):
@@ -65,13 +65,13 @@ def split_file():
         pbar.update(1)
     pbar.close()
 
-    recs_per_file = CHUNK_SIZE * 2
+    recs_per_file = CHUNK_SIZE*2
     for idx in range(0, len(records), recs_per_file):
-        part = idx // recs_per_file
+        part = idx//recs_per_file
         with open(f"{TEMP_DIR}/chunk_{part}.txt", 'w', encoding='utf-8') as out:
-            out.writelines(records[idx:idx + recs_per_file])
+            out.writelines(records[idx:idx+recs_per_file])
 
-# === PROCESS ONE CHUNK WITH DEBUG ===
+# === process one chunk ===
 def process_chunk(args):
     chunk_path, result_list = args
     pattern = re.compile(EMAIL_REGEX, re.IGNORECASE)
@@ -87,35 +87,17 @@ def process_chunk(args):
         total_recs += 1
         topic = lines[i].strip()
         ct_line = lines[i+1].strip() if i+1 < len(lines) else ""
-        m_ct = re.match(r'^CreateTime:(\d+)\s+(.*)$', ct_line)
+        m_ct = re.match(r"^CreateTime:(\d+)\s+(.*)$", ct_line)
         if not m_ct:
             continue
         timestamp, payload_text = m_ct.group(1), m_ct.group(2)
-        full_record = lines[i] + lines[i+1]
 
-        # --- DEBUG #1: raw byte dump if still no match over full_record ---
-        if not pattern.search(full_record):
-            print("DEBUG BYTES:", [hex(ord(c)) for c in full_record])
-
-        # --- DEBUG #2: punctuation-stripped test ---
-        clean = (payload_text
-                 .replace('"',' ')
-                 .replace('}',' ')
-                 .replace('{',' ')
-                 .replace('[',' ')
-                 .replace(']',' ')
-                 .replace(',',' '))
-        test_matches = list(pattern.finditer(clean))
-        if test_matches and not pattern.search(payload_text):
-            print("DEBUG PUNCT STRIP works:", [m.group() for m in test_matches])
-
-        # normal matching on payload_text
         matches = list(pattern.finditer(payload_text))
         if not matches:
             continue
         matched_recs += 1
 
-        # parse JSON for field lookup
+        # parse JSON for finding field names
         try:
             obj = json.loads(payload_text)
         except json.JSONDecodeError:
@@ -126,7 +108,7 @@ def process_chunk(args):
         last = 0
         fields = []
         for mt in matches:
-            s, e = mt.span()
+            s, e = mt.span(1)
             if s > last:
                 para.add_run(payload_text[last:s])
             run = para.add_run(payload_text[s:e])
@@ -134,37 +116,31 @@ def process_chunk(args):
             last = e
 
             # find JSON field path
-            val = mt.group()
+            val = mt.group(1)
             path = find_field(obj, val) or []
             fields.append(".".join(path))
 
         if last < len(payload_text):
             para.add_run(payload_text[last:])
 
-        # append fields in red
+        # append field names in red
         if fields:
             para.add_run(" | field: ")
             for idx, fld in enumerate(fields):
                 if idx:
                     para.add_run(", ")
-                fld_run = para.add_run(fld)
-                fld_run.font.color.rgb = RGBColor(255, 0, 0)
+                fr = para.add_run(fld)
+                fr.font.color.rgb = RGBColor(255, 0, 0)
 
         # collect for Excel
-        for mt, fld in zip(matches, fields):
-            matches_data.append((
-                topic,
-                timestamp,
-                payload_text,
-                mt.group(),
-                fld
-            ))
+        for val, fld in zip((mt.group(1) for mt in matches), fields):
+            matches_data.append((topic, timestamp, payload_text, val, fld))
 
-    part_id = os.path.splitext(os.path.basename(chunk_path))[0].split('_')[-1]
+    part_id = os.path.splitext(os.path.basename(chunk_path))[0].split("_")[-1]
     doc.save(f"{TEMP_DIR}/chunk_{part_id}.docx")
     result_list.append((matches_data, total_recs, matched_recs))
 
-# === MERGE WORD CHUNKS ===
+# === merge Word chunks ===
 def merge_word():
     merged = Document()
     files = sorted(f for f in os.listdir(TEMP_DIR) if f.endswith(".docx"))
@@ -174,21 +150,22 @@ def merge_word():
             for para in doc.paragraphs:
                 new_para = merged.add_paragraph()
                 for run in para.runs:
-                    new_run = new_para.add_run(run.text)
+                    nr = new_para.add_run(run.text)
                     if run.font.color and run.font.color.rgb:
-                        new_run.font.color.rgb = run.font.color.rgb
-                    new_run.bold      = run.bold
-                    new_run.italic    = run.italic
-                    new_run.underline = run.underline
+                        nr.font.color.rgb = run.font.color.rgb
+                    nr.bold = run.bold
+                    nr.italic = run.italic
+                    nr.underline = run.underline
             pbar.update(1)
     merged.save(OUTPUT_DOCX)
 
-# === WRITE EXCEL ===
+# === write Excel ===
 def write_excel(all_matches):
     wb = xlsxwriter.Workbook(OUTPUT_XLSX)
     ws = wb.add_worksheet()
-    red = wb.add_format({'font_color': 'red'})
+    red = wb.add_format({'font_color':'red'})
 
+    # headers
     ws.write_row(0, 0, ["Topic","Timestamp","Payload","Match","Field"])
     row = 1
     for topic, ts, payload, match, field in all_matches:
@@ -198,18 +175,19 @@ def write_excel(all_matches):
         ws.write(row, 3, match, red)
         ws.write(row, 4, field)
         row += 1
+
     wb.close()
 
-# === MAIN ===
+# === main ===
 if __name__ == "__main__":
-    print("=== EMAIL DEBUG EXTRACTOR ===")
-    print("Using regex:", EMAIL_REGEX)
+    print("=== EMAIL EXTRACTOR ===")
+    print("Regex:", EMAIL_REGEX)
 
     split_file()
     manager = Manager()
     results = manager.list()
 
-    chunks = [os.path.join(TEMP_DIR, f) for f in os.listdir(TEMP_DIR) if f.endswith(".txt")]
+    chunks = [os.path.join(TEMP_DIR,f) for f in os.listdir(TEMP_DIR) if f.endswith(".txt")]
     with tqdm(total=len(chunks), desc="Processing chunks") as pbar, \
          Pool(min(cpu_count(), len(chunks))) as pool:
         for _ in pool.imap_unordered(process_chunk, [(c, results) for c in chunks]):
@@ -222,11 +200,11 @@ if __name__ == "__main__":
         total_recs    += recs
         total_matched += matched
 
-    print(f"\nRecords scanned: {total_recs}, with emails: {total_matched}, matches: {len(all_matches)}")
+    print(f"\nRecords scanned: {total_recs}, records with emails: {total_matched}, total matches: {len(all_matches)}")
 
     merge_word()
     write_excel(all_matches)
 
     shutil.rmtree(TEMP_DIR)
-    print(f"\n→ Word saved to {OUTPUT_DOCX}")
+    print(f"→ Word saved to {OUTPUT_DOCX}")
     print(f"→ Excel saved to {OUTPUT_XLSX}")
