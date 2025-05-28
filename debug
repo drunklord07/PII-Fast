@@ -1,0 +1,36 @@
+How to pin down exactly which issue it is
+Print every “no-match” payload
+
+python
+Copy
+Edit
+if not pattern.search(payload_text):
+    print("NO EMAILS:", repr(payload_text))
+Grab one of those lines and test it interactively against your regex.
+
+Try the looser, multi-case-TLD pattern
+
+python
+Copy
+Edit
+EMAIL_REGEX = r"\b[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b"
+pattern = re.compile(EMAIL_REGEX, re.IGNORECASE)
+Re-run and see if those “missing” ones now light up.
+
+Scan the whole record
+Temporarily change
+
+python
+Copy
+Edit
+matches = list(pattern.finditer(payload_text))
+to
+
+python
+Copy
+Edit
+full = lines[i] + lines[i+1]
+matches = list(pattern.finditer(full))
+If that instantly fixes it, you’ll know it’s a payload-only issue.
+
+Once you identify which of these is tripping you up, we can update the script to handle it 100%. Let me know what you discover!
