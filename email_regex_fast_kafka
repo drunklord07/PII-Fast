@@ -1,3 +1,4 @@
+```python
 #!/usr/bin/env python3
 import re
 import os
@@ -20,9 +21,9 @@ LOG_PATTERN = re.compile(
 )
 
 EMAIL_REGEX = re.compile(
-    r'(?<![\w@.-])'                 # no word/[@.-] before
+    r'(?<![\w@.-])'                                 # no word/[@.-] before
     r'([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})'  # email
-    r'(?![\w@.-])'                  # no word/[@.-] after
+    r'(?![\w@.-])'                                  # no word/[@.-] after
 )
 
 def scan_file(input_file):
@@ -102,12 +103,12 @@ def main():
         description="Scan Kafka logs for emails → .docx + .xlsx"
     )
 
-    # Make input_file optional; defaults to kafka_sample.log if not given
+    # Make input_file optional; defaults to input_file.txt if not given
     parser.add_argument(
         'input_file',
         nargs='?',
-        default='kafka_sample.log',
-        help="Path to your Kafka log (default: kafka_sample.log)"
+        default='input_file.txt',
+        help="Path to your Kafka log (default: input_file.txt)"
     )
     parser.add_argument(
         '--output-dir',
@@ -135,3 +136,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+```
