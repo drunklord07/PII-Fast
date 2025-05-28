@@ -11,13 +11,13 @@ from tqdm import tqdm
 # === CONFIG ===
 CHUNK_SIZE    = 2000
 INPUT_FILE    = "input.txt"
-# Looser, multi-TLD, word-boundary regex; case-insensitive
+# loose, case-insensitive, multi-TLD pattern
 EMAIL_REGEX   = r"\b[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b"
 OUTPUT_DOCX   = "output_email.docx"
 OUTPUT_XLSX   = "output_email.xlsx"
 TEMP_DIR      = "temp_parts"
 
-# === FIND_FIELD (unchanged) ===
+# === RECURSIVE FIELD FINDER (unchanged) ===
 def find_field(obj, val):
     if isinstance(obj, dict):
         for k, v in obj.items():
@@ -47,7 +47,7 @@ def find_field(obj, val):
                 return sub
     return None
 
-# === SPLIT INPUT INTO CHUNKS ===
+# === SPLIT INTO CHUNKS ===
 def split_file():
     if os.path.exists(TEMP_DIR):
         shutil.rmtree(TEMP_DIR)
@@ -71,7 +71,7 @@ def split_file():
         with open(f"{TEMP_DIR}/chunk_{part}.txt", 'w', encoding='utf-8') as out:
             out.writelines(records[idx:idx + recs_per_file])
 
-# === PROCESS A CHUNK WITH DEBUGGING ===
+# === PROCESS ONE CHUNK WITH DEBUG ===
 def process_chunk(args):
     chunk_path, result_list = args
     pattern = re.compile(EMAIL_REGEX, re.IGNORECASE)
@@ -93,16 +93,23 @@ def process_chunk(args):
         timestamp, payload_text = m_ct.group(1), m_ct.group(2)
         full_record = lines[i] + lines[i+1]
 
-        # DEBUG: print when payload yields no match
-        if not pattern.search(payload_text):
-            if pattern.search(full_record):
-                print("DEBUG: in full_record but not payload:", repr(full_record))
-            else:
-                print("DEBUG: no match in record:", repr(full_record))
+        # --- DEBUG #1: raw byte dump if still no match over full_record ---
+        if not pattern.search(full_record):
+            print("DEBUG BYTES:", [hex(ord(c)) for c in full_record])
 
-        # For debugging, you can switch to scanning full_record instead:
-        # matches = list(pattern.finditer(full_record))
-        # But here we stick with payload_text for real processing:
+        # --- DEBUG #2: punctuation-stripped test ---
+        clean = (payload_text
+                 .replace('"',' ')
+                 .replace('}',' ')
+                 .replace('{',' ')
+                 .replace('[',' ')
+                 .replace(']',' ')
+                 .replace(',',' '))
+        test_matches = list(pattern.finditer(clean))
+        if test_matches and not pattern.search(payload_text):
+            print("DEBUG PUNCT STRIP works:", [m.group() for m in test_matches])
+
+        # normal matching on payload_text
         matches = list(pattern.finditer(payload_text))
         if not matches:
             continue
@@ -114,20 +121,19 @@ def process_chunk(args):
         except json.JSONDecodeError:
             obj = {}
 
-        # Build Word paragraph
+        # build Word paragraph
         para = doc.add_paragraph(f"{topic} | CreateTime:{timestamp} | ")
         last = 0
         fields = []
         for mt in matches:
             s, e = mt.span()
-            # highlight in red
             if s > last:
                 para.add_run(payload_text[last:s])
             run = para.add_run(payload_text[s:e])
             run.font.color.rgb = RGBColor(255, 0, 0)
             last = e
 
-            # determine field path
+            # find JSON field path
             val = mt.group()
             path = find_field(obj, val) or []
             fields.append(".".join(path))
@@ -141,10 +147,10 @@ def process_chunk(args):
             for idx, fld in enumerate(fields):
                 if idx:
                     para.add_run(", ")
-                run = para.add_run(fld)
-                run.font.color.rgb = RGBColor(255, 0, 0)
+                fld_run = para.add_run(fld)
+                fld_run.font.color.rgb = RGBColor(255, 0, 0)
 
-        # Collect for Excel
+        # collect for Excel
         for mt, fld in zip(matches, fields):
             matches_data.append((
                 topic,
@@ -192,7 +198,6 @@ def write_excel(all_matches):
         ws.write(row, 3, match, red)
         ws.write(row, 4, field)
         row += 1
-
     wb.close()
 
 # === MAIN ===
@@ -217,11 +222,11 @@ if __name__ == "__main__":
         total_recs    += recs
         total_matched += matched
 
-    print(f"\nRecords scanned: {total_recs}, with emails: {total_matched}, total matches: {len(all_matches)}")
+    print(f"\nRecords scanned: {total_recs}, with emails: {total_matched}, matches: {len(all_matches)}")
 
     merge_word()
     write_excel(all_matches)
 
     shutil.rmtree(TEMP_DIR)
-    print(f"→ Word saved to {OUTPUT_DOCX}")
+    print(f"\n→ Word saved to {OUTPUT_DOCX}")
     print(f"→ Excel saved to {OUTPUT_XLSX}")
