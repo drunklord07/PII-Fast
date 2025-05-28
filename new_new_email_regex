@@ -19,32 +19,46 @@ TEMP_DIR      = "temp_parts"
 # === FIND_FIELD ===
 def find_field(obj, val):
     """
-    Recursively search obj (dict or list) for a leaf whose string(value) == val.
+    Recursively search obj (dict or list) for a leaf whose string(value) == val
+    or, if a primitive string contains commas, split it and match val exactly.
     Returns list of keys forming the path, or None if not found.
     """
     if isinstance(obj, dict):
         for k, v in obj.items():
+            # list: check each element
             if isinstance(v, list):
-                # if it's a list, check primitives first
                 for item in v:
+                    # primitive in list
                     if not isinstance(item, (dict, list)) and str(item) == val:
                         return [k]
-                    # or dive deeper
+                    # nested in list
                     sub = find_field(item, val)
                     if sub:
                         return [k] + sub
+
+            # nested dict
             elif isinstance(v, dict):
                 sub = find_field(v, val)
                 if sub:
                     return [k] + sub
+
+            # primitive (including comma-separated string)
             else:
-                if str(v) == val:
+                s = str(v)
+                if s == val:
                     return [k]
+                # handle comma-separated lists in a single string
+                if isinstance(v, str):
+                    parts = [p.strip() for p in s.split(',')]
+                    if val in parts:
+                        return [k]
+
     elif isinstance(obj, list):
         for item in obj:
             sub = find_field(item, val)
             if sub:
                 return sub
+
     return None
 
 # === SPLIT INPUT INTO CHUNKS ===
