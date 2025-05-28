@@ -9,7 +9,7 @@ import xlsxwriter
 from tqdm import tqdm
 
 # === CONFIG ===
-CHUNK_SIZE    = 2000                # number of records per chunk
+CHUNK_SIZE    = 2000
 INPUT_FILE    = "input.txt"
 EMAIL_REGEX   = r"(?<![\w@.-])([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[A-Za-z]{2,})(?![\w@.-])"
 OUTPUT_DOCX   = "output_email.docx"
@@ -18,7 +18,6 @@ TEMP_DIR      = "temp_parts"
 
 # === UTILITIES ===
 def flatten_json(y):
-    """Flatten nested JSON into a dict of key paths → values."""
     out = {}
     def _flat(x, name=""):
         if isinstance(x, dict):
@@ -29,49 +28,41 @@ def flatten_json(y):
     _flat(y)
     return out
 
-# === SPLIT INPUT INTO RECORD CHUNKS ===
+# === SPLIT INTO CHUNKS ===
 def split_file():
     if os.path.exists(TEMP_DIR):
         shutil.rmtree(TEMP_DIR)
     os.makedirs(TEMP_DIR)
 
-    # Read all lines
     with open(INPUT_FILE, 'r', encoding='utf-8', errors='ignore') as f:
         lines = f.readlines()
 
-    # Build record list (two lines per record)
-    records = []
     total_recs = (len(lines) + 1) // 2
     pbar = tqdm(total=total_recs, desc="Splitting file", unit="records")
+    records = []
     for i in range(0, len(lines), 2):
-        id_line = lines[i]
-        ct_line = lines[i+1] if i+1 < len(lines) else "\n"
-        records.extend([id_line, ct_line])
+        records.append(lines[i])
+        records.append(lines[i+1] if i+1 < len(lines) else "\n")
         pbar.update(1)
     pbar.close()
 
-    # Write chunks of CHUNK_SIZE records
-    rec_lines = CHUNK_SIZE * 2
-    for part, start in enumerate(range(0, len(records), rec_lines)):
-        chunk = records[start:start + rec_lines]
+    recs_per_file = CHUNK_SIZE * 2
+    for idx in range(0, len(records), recs_per_file):
+        part = idx // recs_per_file
         with open(f"{TEMP_DIR}/chunk_{part}.txt", 'w', encoding='utf-8') as out:
-            out.writelines(chunk)
+            out.writelines(records[idx:idx + recs_per_file])
 
-# === PROCESS A SINGLE CHUNK ===
+# === PROCESS A CHUNK ===
 def process_chunk(args):
     chunk_path, result_list = args
     pattern = re.compile(EMAIL_REGEX)
-
-    # prepare per-chunk Word doc
     doc = Document()
     matches_data = []
-    total_recs = 0
-    matched_recs = 0
+    total_recs = matched_recs = 0
 
     with open(chunk_path, 'r', encoding='utf-8', errors='ignore') as f:
         lines = f.readlines()
 
-    # iterate over records (2 lines each)
     for i in range(0, len(lines), 2):
         total_recs += 1
         topic = lines[i].strip()
@@ -79,143 +70,120 @@ def process_chunk(args):
         m = re.match(r'^CreateTime:(\d+)\s+(.*)$', ct_line)
         if not m:
             continue
-        timestamp = m.group(1)
-        payload_text = m.group(2)
+        timestamp, payload_text = m.group(1), m.group(2)
 
-        # parse JSON for field lookup
         try:
-            payload_obj = json.loads(payload_text)
-            flat = flatten_json(payload_obj)
+            flat = flatten_json(json.loads(payload_text))
         except json.JSONDecodeError:
             flat = {}
 
-        # find email matches
         matches = list(pattern.finditer(payload_text))
         if not matches:
             continue
         matched_recs += 1
 
-        # build Word paragraph
+        # Word paragraph
         para = doc.add_paragraph(f"{topic} | CreateTime:{timestamp} | ")
         last = 0
-        for match in matches:
-            start, end = match.span(1)
-            if start > last:
-                para.add_run(payload_text[last:start])
-            run = para.add_run(payload_text[start:end])
+        for mt in matches:
+            s, e = mt.span(1)
+            if s > last:
+                para.add_run(payload_text[last:s])
+            run = para.add_run(payload_text[s:e])
             run.font.color.rgb = RGBColor(255, 0, 0)
-            last = end
+            last = e
         if last < len(payload_text):
             para.add_run(payload_text[last:])
 
-        # append field names in red
+        # append field names
         fields = []
-        for match in matches:
-            val = match.group(1)
-            field = next((k for k, v in flat.items() if str(v) == val), "")
+        for mt in matches:
+            val = mt.group(1)
+            field = next((k for k,v in flat.items() if str(v)==val), "")
             if field:
                 fields.append(field)
         if fields:
             para.add_run(" | field: ")
             for idx, fld in enumerate(fields):
-                if idx > 0:
-                    para.add_run(", ")
+                if idx: para.add_run(", ")
                 run = para.add_run(fld)
                 run.font.color.rgb = RGBColor(255, 0, 0)
 
-        # collect for Excel: one row per match
-        for match in matches:
-            val = match.group(1)
-            field = next((k for k, v in flat.items() if str(v) == val), "")
+        for mt in matches:
+            val = mt.group(1)
+            field = next((k for k,v in flat.items() if str(v)==val), "")
             matches_data.append((topic, timestamp, payload_text, val, field))
 
-    # save chunk docx and append results
     part_id = os.path.splitext(os.path.basename(chunk_path))[0].split('_')[-1]
     doc.save(f"{TEMP_DIR}/chunk_{part_id}.docx")
     result_list.append((matches_data, total_recs, matched_recs))
 
-# === MERGE ALL WORD CHUNKS ===
+# === MERGE WORD FILES (PRESERVE RGBColor DIRECTLY) ===
 def merge_word():
     merged = Document()
     part_files = sorted(f for f in os.listdir(TEMP_DIR) if f.endswith(".docx"))
     with tqdm(total=len(part_files), desc="Merging Word files") as pbar:
-        for file in part_files:
-            doc = Document(os.path.join(TEMP_DIR, file))
+        for fn in part_files:
+            doc = Document(os.path.join(TEMP_DIR, fn))
             for para in doc.paragraphs:
                 new_para = merged.add_paragraph()
                 for run in para.runs:
                     new_run = new_para.add_run(run.text)
                     if run.font.color and run.font.color.rgb:
-                        r, g, b = run.font.color.rgb.rgb
-                        new_run.font.color.rgb = RGBColor(r, g, b)
+                        new_run.font.color.rgb = run.font.color.rgb
                     new_run.bold      = run.bold
                     new_run.italic    = run.italic
                     new_run.underline = run.underline
             pbar.update(1)
     merged.save(OUTPUT_DOCX)
 
-# === WRITE EXCEL WITH MATCHES ===
+# === WRITE EXCEL ===
 def write_excel(all_matches):
-    workbook  = xlsxwriter.Workbook(OUTPUT_XLSX)
-    worksheet = workbook.add_worksheet()
-    red_fmt   = workbook.add_format({'font_color': 'red'})
+    wb = xlsxwriter.Workbook(OUTPUT_XLSX)
+    ws = wb.add_worksheet()
+    red = wb.add_format({'font_color':'red'})
 
-    # headers
-    headers = ["Topic", "Timestamp", "Payload", "Match", "Field"]
-    worksheet.write_row(0, 0, headers)
+    headers = ["Topic","Timestamp","Payload","Match","Field"]
+    ws.write_row(0, 0, headers)
 
     row = 1
-    for topic, timestamp, payload, match, field in all_matches:
-        worksheet.write(row, 0, topic)
-        worksheet.write(row, 1, timestamp)
-        worksheet.write(row, 2, payload)
-        worksheet.write(row, 3, match, red_fmt)
-        worksheet.write(row, 4, field)
+    for topic, ts, payload, match, field in all_matches:
+        ws.write(row, 0, topic)
+        ws.write(row, 1, ts)
+        ws.write(row, 2, payload)
+        ws.write(row, 3, match, red)
+        ws.write(row, 4, field)
         row += 1
 
-    workbook.close()
+    wb.close()
 
-# === MAIN ORCHESTRATION ===
+# === MAIN ===
 if __name__ == "__main__":
-    print("=== EMAIL EXTRACTOR (Parallel + Colored Output) ===")
-    print("Regex used:", EMAIL_REGEX)
+    print("=== EMAIL EXTRACTOR ===")
+    print("Regex:", EMAIL_REGEX)
 
-    # split into chunks
     split_file()
+    manager = Manager()
+    results = manager.list()
 
-    # parallel chunk processing
-    print("\nProcessing chunks in parallel...")
-    manager     = Manager()
-    results     = manager.list()
-    chunk_files = [os.path.join(TEMP_DIR, f) for f in os.listdir(TEMP_DIR) if f.endswith(".txt")]
-    args        = [(cf, results) for cf in chunk_files]
+    chunks = [os.path.join(TEMP_DIR,f) for f in os.listdir(TEMP_DIR) if f.endswith(".txt")]
+    with tqdm(total=len(chunks), desc="Processing chunks") as pbar, \
+         Pool(min(cpu_count(), len(chunks))) as pool:
+        for _ in pool.imap_unordered(process_chunk, [(c, results) for c in chunks]):
+            pbar.update(1)
 
-    with tqdm(total=len(chunk_files), desc="Chunk Processing") as pbar:
-        with Pool(min(cpu_count(), len(chunk_files))) as pool:
-            for _ in pool.imap_unordered(process_chunk, args):
-                pbar.update(1)
+    all_matches = []
+    scanned = matched = 0
+    for data, tot, mt in results:
+        all_matches.extend(data)
+        scanned += tot
+        matched += mt
 
-    # aggregate results
-    all_matches          = []
-    total_records       = 0
-    total_matched       = 0
-    for matches_data, recs, matched in results:
-        all_matches.extend(matches_data)
-        total_records  += recs
-        total_matched  += matched
+    print(f"Scanned records: {scanned}, Matched records: {matched}, Total matches: {len(all_matches)}")
 
-    print(f"\nTotal records scanned : {total_records}")
-    print(f"Records with matches  : {total_matched}")
-    print(f"Total matches found   : {len(all_matches)}")
-
-    # outputs
     merge_word()
     write_excel(all_matches)
 
-    # cleanup
-    print("\nCleaning up...")
     shutil.rmtree(TEMP_DIR)
-
-    print("\nDONE ✅")
-    print(f"→ Word Output : {OUTPUT_DOCX}")
-    print(f"→ Excel Output: {OUTPUT_XLSX}")
+    print(f"→ Word saved to {OUTPUT_DOCX}")
+    print(f"→ Excel saved to {OUTPUT_XLSX}")
