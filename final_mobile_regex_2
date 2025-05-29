@@ -1,4 +1,3 @@
-```python
 import os
 import re
 import json
@@ -20,33 +19,28 @@ TEMP_DIR     = "temp_parts"
 # === FLATTEN JSON ===
 def flatten_json(obj, prefix=""):
     """
-    Recursively flatten obj (dict/list), parsing JSON strings if found,
-    and return a mapping from 'path' to value.
+    Recursively flatten dicts/lists and parse JSON strings.
+    Returns a dict mapping each 'path' to its value.
     """
     result = {}
     if isinstance(obj, dict):
         for k, v in obj.items():
             path = f"{prefix}{k}"
-            # nested dict
-            if isinstance(v, dict):
+            if isinstance(v, dict) or isinstance(v, list):
                 result.update(flatten_json(v, path + "."))
-            # list
-            elif isinstance(v, list):
-                for i, item in enumerate(v):
-                    result.update(flatten_json(item, f"{path}[{i}]."))
-            # JSON string?
             elif isinstance(v, str) and v.strip().startswith(("{", "[")):
+                # attempt to parse JSON inside strings
                 try:
                     inner = json.loads(v)
-                except (ValueError, TypeError):
+                except Exception:
                     result[path] = v
                 else:
                     result.update(flatten_json(inner, path + "."))
             else:
                 result[path] = v
     elif isinstance(obj, list):
-        for i, item in enumerate(obj):
-            result.update(flatten_json(item, f"{prefix}[{i}]."))
+        for idx, item in enumerate(obj):
+            result.update(flatten_json(item, f"{prefix}[{idx}]."))
     return result
 
 # === LOAD RECORDS ===
@@ -76,7 +70,8 @@ def chunk_records(records):
 # === PROCESS ONE CHUNK ===
 def process_chunk(args):
     chunk, idx, result_list = args
-    pattern = re.compile(MOBILE_REGEX)
+    pattern = re.compile(MOBILE_REGEX, re.IGNORECASE)
+
     doc = Document()
     matches_data = []
     recs_seen = recs_with_mobile = 0
@@ -88,7 +83,7 @@ def process_chunk(args):
             continue
         recs_with_mobile += 1
 
-        # parse JSON once and flatten
+        # parse and flatten JSON
         try:
             obj = json.loads(payload)
         except json.JSONDecodeError:
@@ -98,6 +93,7 @@ def process_chunk(args):
         # build Word paragraph
         para = doc.add_paragraph(f"{identifier} | CreateTime:{ts} | ")
         last = 0
+        fields = []
         for mt in mlist:
             s, e = mt.span()
             if s > last:
@@ -113,14 +109,15 @@ def process_chunk(args):
                 if str(val) == mobile:
                     field = path
                     break
+            fields.append(field)
 
+            # record for Excel
             matches_data.append((identifier, ts, payload, mobile, field))
 
         if last < len(payload):
             para.add_run(payload[last:])
 
-        # append all field names
-        fields = [fld for *_, fld in matches_data[-len(mlist):]]
+        # append field names in red
         para.add_run(" | field: ")
         for i, fld in enumerate(fields):
             if i:
@@ -143,9 +140,9 @@ def merge_word():
             continue
         doc = Document(os.path.join(TEMP_DIR, fn))
         for para in doc.paragraphs:
-            p2 = merged.add_paragraph()
+            out_p = merged.add_paragraph()
             for run in para.runs:
-                nr = p2.add_run(run.text)
+                nr = out_p.add_run(run.text)
                 if run.font.color and run.font.color.rgb:
                     nr.font.color.rgb = run.font.color.rgb
                 nr.bold = run.bold
@@ -159,6 +156,7 @@ def write_excel(all_matches):
     ws = wb.add_worksheet()
     red = wb.add_format({'font_color': 'red'})
 
+    # header
     ws.write_row(0, 0, ["Identifier", "Timestamp", "Payload", "Mobile", "Field"])
     row = 1
     for identifier, ts, payload, mobile, field in all_matches:
@@ -206,4 +204,3 @@ if __name__ == "__main__":
     shutil.rmtree(TEMP_DIR)
     print(f"\n→ Word saved to {OUTPUT_DOCX}")
     print(f"→ Excel saved to {OUTPUT_XLSX}")
-```
