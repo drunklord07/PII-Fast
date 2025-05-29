@@ -16,11 +16,17 @@ OUTPUT_DOCX  = "final_output_mobile_nested.docx"
 OUTPUT_XLSX  = "final_output_mobile_nested.xlsx"
 TEMP_DIR     = "temp_parts"
 
-# === CLEAN NULL-BYTES ===
+# === UTILITIES ===
 def clean_text(s: str) -> str:
+    # strip null bytes
     return s.replace('\x00', '')
 
-# === FLATTEN JSON (for well-formed parts) ===
+def unescape_payload(s: str) -> str:
+    # turn \" into " and \{ } back to braces so regex can see keys
+    s = s.replace('\\"', '"')
+    s = re.sub(r'\\([{}])', r'\1', s)
+    return s
+
 def flatten_json(obj, prefix=""):
     flat = {}
     if isinstance(obj, dict):
@@ -38,15 +44,15 @@ def flatten_json(obj, prefix=""):
             else:
                 flat[path] = v
     elif isinstance(obj, list):
-        for idx, item in enumerate(obj):
-            flat.update(flatten_json(item, f"{prefix}[{idx}]."))
+        for i, item in enumerate(obj):
+            flat.update(flatten_json(item, f"{prefix}[{i}]."))
     return flat
 
-# === LOAD AND GROUP RECORDS ===
+# === LOAD & GROUP RECORDS ===
 def load_records():
     records = []
     last_id = None
-    ct_re = re.compile(r"^CreateTime:(\d+)\s+(.*)$")
+    ct_re    = re.compile(r"^CreateTime:(\d+)\s+(.*)$")
     with open(INPUT_FILE, 'r', encoding='utf-8', errors='ignore') as f:
         for raw in f:
             line = raw.rstrip('\r\n')
@@ -62,9 +68,9 @@ def load_records():
 # === SPLIT INTO CHUNKS ===
 def chunk_records(records):
     for i in range(0, len(records), CHUNK_SIZE):
-        yield records[i:i + CHUNK_SIZE], i // CHUNK_SIZE
+        yield records[i:i+CHUNK_SIZE], i//CHUNK_SIZE
 
-# === WORKER ===
+# === PROCESS A CHUNK ===
 def process_chunk(args):
     chunk, idx, result_list = args
     pat = re.compile(MOBILE_REGEX)
@@ -80,13 +86,16 @@ def process_chunk(args):
             continue
         recs_with_mobile += 1
 
-        # try flattening well-formed JSON
+        # attempt JSON flatten
         flat = {}
         try:
             obj = json.loads(payload)
             flat = flatten_json(obj)
         except json.JSONDecodeError:
             pass
+
+        # prepare unescaped version for fallback
+        raw = unescape_payload(payload)
 
         # build Word paragraph
         para = doc.add_paragraph(f"{identifier} | CreateTime:{ts} | ")
@@ -102,13 +111,13 @@ def process_chunk(args):
             run.font.color.rgb = RGBColor(255, 0, 0)
             last = e
 
-            # find field via flattened map
-            field = next((k for k,v in flat.items() if str(v) == number), "")
-            # fallback: generic regex for "key":number
+            # lookup field via flattened JSON
+            field = next((k for k, v in flat.items() if str(v) == number), "")
+            # fallback: generic regex on unescaped text
             if not field:
-                frx = re.search(r'"([^"]+)"\s*:\s*' + re.escape(number), payload)
-                if frx:
-                    field = frx.group(1)
+                fm = re.search(r'"([^"]+)"\s*:\s*' + re.escape(number), raw)
+                if fm:
+                    field = fm.group(1)
 
             fields.append(field)
             matches_data.append((identifier, ts, payload, number, field))
@@ -116,7 +125,7 @@ def process_chunk(args):
         if last < len(payload):
             para.add_run(payload[last:])
 
-        # append fields in red
+        # append fields
         para.add_run(" | field: ")
         for i, fld in enumerate(fields):
             if i:
@@ -124,14 +133,14 @@ def process_chunk(args):
             fr = para.add_run(fld)
             fr.font.color.rgb = RGBColor(255, 0, 0)
 
-    # save Word chunk if any matches
+    # save chunk docx if we found matches
     if matches_data:
         os.makedirs(TEMP_DIR, exist_ok=True)
         doc.save(os.path.join(TEMP_DIR, f"chunk_{idx}.docx"))
 
     result_list.append((matches_data, recs_seen, recs_with_mobile))
 
-# === MERGE WORD FILES ===
+# === MERGE WORD CHUNKS ===
 def merge_word():
     merged = Document()
     for fn in tqdm(sorted(os.listdir(TEMP_DIR)), desc="Merging Word"):
@@ -149,12 +158,11 @@ def merge_word():
                 nr.underline = run.underline
     merged.save(OUTPUT_DOCX)
 
-# === WRITE XLSX ===
+# === WRITE EXCEL ===
 def write_excel(all_matches):
     wb = xlsxwriter.Workbook(OUTPUT_XLSX)
     ws = wb.add_worksheet()
     red = wb.add_format({'font_color': 'red'})
-
     ws.write_row(0, 0, ["Identifier", "Timestamp", "Payload", "Mobile", "Field"])
     row = 1
     for ident, ts, payload, number, field in all_matches:
@@ -186,9 +194,9 @@ if __name__ == "__main__":
 
     all_matches = []
     tot = has = 0
-    for data, seen, with_mobile in results:
+    for data, recs, with_mobile in results:
         all_matches.extend(data)
-        tot += seen
+        tot += recs
         has += with_mobile
 
     print(f"Records scanned: {tot}, with mobile: {has}, matches: {len(all_matches)}")
