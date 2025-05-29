@@ -12,136 +12,146 @@ from tqdm import tqdm
 INPUT_FILE     = "input.txt"
 CHUNK_SIZE     = 2000
 MOBILE_REGEX   = r"(?<!\d)(?:\+91[\-\s]?|91[\-\s]?|91|0)?[6-9]\d{9}(?!\d)"
-OUTPUT_DOCX    = "output_mobile.docx"
-OUTPUT_XLSX    = "output_mobile.xlsx"
+OUTPUT_DOCX    = "final_output_mobile_nested.docx"
+OUTPUT_XLSX    = "final_output_mobile_nested.xlsx"
 TEMP_DIR       = "temp_parts"
-DEBUG_LOG      = "debug_no_mobile.log"
 
-# === RECURSIVE FIELD FINDER ===
-def find_field(obj, val):
+# === CLEAN NULL-BYTES ===
+def clean_text(s: str) -> str:
+    return s.replace('\x00', '')
+
+# === FLATTEN JSON ===
+def flatten_json(obj, prefix=""):
+    flat = {}
     if isinstance(obj, dict):
         for k, v in obj.items():
-            if isinstance(v, list):
-                for item in v:
-                    if not isinstance(item, (dict, list)) and str(item) == val:
-                        return [k]
-                    sub = find_field(item, val)
-                    if sub:
-                        return [k] + sub
-            elif isinstance(v, dict):
-                sub = find_field(v, val)
-                if sub:
-                    return [k] + sub
+            path = f"{prefix}{k}"
+            if isinstance(v, (dict, list)):
+                flat.update(flatten_json(v, path + "."))
+            elif isinstance(v, str) and v.strip().startswith(("{", "[")):
+                try:
+                    inner = json.loads(v)
+                except Exception:
+                    flat[path] = v
+                else:
+                    flat.update(flatten_json(inner, path + "."))
             else:
-                s = str(v)
-                if s == val:
-                    return [k]
-                if isinstance(v, str):
-                    parts = [p.strip() for p in s.split(',')]
-                    if val in parts:
-                        return [k]
+                flat[path] = v
     elif isinstance(obj, list):
-        for item in obj:
-            sub = find_field(item, val)
-            if sub:
-                return sub
-    return None
+        for idx, item in enumerate(obj):
+            flat.update(flatten_json(item, f"{prefix}[{idx}]."))
+    return flat
 
-# === PARSE RECORDS BY CreateTime LINES ===
+# === LOAD RECORDS ===
 def load_records():
     records = []
     last_id = None
-    ct_re   = re.compile(r"^CreateTime:(\d+)\s+(.*)$")
+    ct_re = re.compile(r"^CreateTime:(\d+)\s+(.*)$")
     with open(INPUT_FILE, 'r', encoding='utf-8', errors='ignore') as f:
         for raw in f:
             line = raw.rstrip('\r\n')
             m = ct_re.match(line)
-            if m and last_id is not None:
-                records.append((last_id, m.group(1), m.group(2)))
+            if m and last_id:
+                ts = m.group(1)
+                payload = clean_text(m.group(2))
+                records.append((clean_text(last_id), ts, payload))
             elif line.strip():
                 last_id = line.strip()
     return records
 
-# === CHUNKING ===
+# === SPLIT INTO CHUNKS ===
 def chunk_records(records):
     for i in range(0, len(records), CHUNK_SIZE):
-        yield records[i:i+CHUNK_SIZE], i // CHUNK_SIZE
+        yield records[i:i + CHUNK_SIZE], i // CHUNK_SIZE
 
-# === WORKER ===
+# === PROCESS A CHUNK ===
 def process_chunk(args):
     chunk, idx, result_list = args
-    pattern = re.compile(MOBILE_REGEX)
-
+    patt = re.compile(MOBILE_REGEX)
     doc = Document()
-    matches_data = []
-    seen = 0
-    with_mobile = 0
-
-    debug_f = open(DEBUG_LOG, 'a', encoding='utf-8')
+    results = []
+    recs_seen = recs_with_mobile = 0
 
     for identifier, ts, payload in chunk:
-        seen += 1
-        mlist = list(pattern.finditer(payload))
-        if not mlist:
-            debug_f.write(f"NO MOBILE in: {identifier} | {ts} | {payload}\n")
+        recs_seen += 1
+        matches = list(patt.finditer(payload))
+        if not matches:
             continue
-        with_mobile += 1
+        recs_with_mobile += 1
 
-        # parse JSON once
+        # First, try to parse the whole payload
+        flat = {}
         try:
             obj = json.loads(payload)
+            flat = flatten_json(obj)
         except json.JSONDecodeError:
-            obj = {}
+            # Fallback: extract the nested npayload {...} block
+            m = re.search(r'"npayload"\s*:\s*\{', payload)
+            if m:
+                start = m.end() - 1
+                depth = 0
+                for i in range(start, len(payload)):
+                    if payload[i] == '{':
+                        depth += 1
+                    elif payload[i] == '}':
+                        depth -= 1
+                    if depth == 0:
+                        raw = payload[start:i+1]
+                        try:
+                            inner = json.loads(raw)
+                            flat = flatten_json(inner, prefix="npayload.")
+                        except json.JSONDecodeError:
+                            flat = {}
+                        break
 
-        # Word paragraph
+        # Build Word paragraph
         para = doc.add_paragraph(f"{identifier} | CreateTime:{ts} | ")
         last = 0
-
-        for mt in mlist:
+        fields = []
+        for mt in matches:
             s, e = mt.span()
             if s > last:
                 para.add_run(payload[last:s])
             mobile = mt.group()
             run = para.add_run(mobile)
-            run.font.color.rgb = RGBColor(255,0,0)
+            run.font.color.rgb = RGBColor(255, 0, 0)
             last = e
 
-            # find field name
-            path = find_field(obj, mobile) or []
-            field = ".".join(path)
-
-            # record for Excel
-            matches_data.append((identifier, ts, payload, mobile, field))
+            # Lookup field name
+            field = ""
+            for path, val in flat.items():
+                if str(val) == mobile:
+                    field = path
+                    break
+            fields.append(field)
+            results.append((identifier, ts, payload, mobile, field))
 
         if last < len(payload):
             para.add_run(payload[last:])
 
-        # append all field names after payload
-        fields = [fld for _,_,_,_,fld in matches_data[-len(mlist):]]
+        # Append field names
         para.add_run(" | field: ")
-        for i,fld in enumerate(fields):
+        for i, fld in enumerate(fields):
             if i:
                 para.add_run(", ")
             fr = para.add_run(fld)
-            fr.font.color.rgb = RGBColor(255,0,0)
+            fr.font.color.rgb = RGBColor(255, 0, 0)
 
-    debug_f.close()
-
-    # save Word chunk if any matches
-    if matches_data:
+    # Save Word chunk if matches found
+    if results:
         os.makedirs(TEMP_DIR, exist_ok=True)
         doc.save(os.path.join(TEMP_DIR, f"chunk_{idx}.docx"))
 
-    result_list.append((matches_data, seen, with_mobile))
+    result_list.append((results, recs_seen, recs_with_mobile))
 
-# === MERGE WORD ===
+# === MERGE WORD FILES ===
 def merge_word():
     merged = Document()
     for fn in tqdm(sorted(os.listdir(TEMP_DIR)), desc="Merging Word"):
         if not fn.endswith(".docx"):
             continue
-        doc = Document(os.path.join(TEMP_DIR, fn))
-        for para in doc.paragraphs:
+        sub = Document(os.path.join(TEMP_DIR, fn))
+        for para in sub.paragraphs:
             p2 = merged.add_paragraph()
             for run in para.runs:
                 nr = p2.add_run(run.text)
@@ -156,9 +166,8 @@ def merge_word():
 def write_excel(all_matches):
     wb = xlsxwriter.Workbook(OUTPUT_XLSX)
     ws = wb.add_worksheet()
-    red = wb.add_format({'font_color':'red'})
-
-    ws.write_row(0, 0, ["Identifier","Timestamp","Payload","Mobile","Field"])
+    red = wb.add_format({'font_color': 'red'})
+    ws.write_row(0, 0, ["Identifier", "Timestamp", "Payload", "Mobile", "Field"])
     r = 1
     for idf, ts, payload, mobile, field in all_matches:
         ws.write(r, 0, idf)
@@ -170,35 +179,29 @@ def write_excel(all_matches):
     wb.close()
 
 # === MAIN ===
-if __name__=="__main__":
-    # cleanup
-    if os.path.exists(DEBUG_LOG):
-        os.remove(DEBUG_LOG)
+if __name__ == "__main__":
     if os.path.isdir(TEMP_DIR):
         shutil.rmtree(TEMP_DIR)
 
-    print("=== MOBILE EXTRACTOR w/ FIELD NAMES ===")
-    print(f"Using regex: {MOBILE_REGEX}")
-
+    print("=== MOBILE EXTRACTOR FOR NESTED PAYLOADS ===")
     records = load_records()
-    print(f"Found {len(records)} records.")
+    print(f"Total records found: {len(records)}")
     chunks = list(chunk_records(records))
 
     mgr = Manager()
     results = mgr.list()
-
     with Pool(min(cpu_count(), len(chunks))) as pool:
         list(tqdm(pool.imap_unordered(
             process_chunk,
             [(chunk, idx, results) for chunk, idx in chunks]
-        ), total=len(chunks), desc="Processing"))
+        ), total=len(chunks), desc="Processing chunks"))
 
     all_matches = []
     tot = has = 0
-    for data, seen, with_mobile in results:
+    for data, seen, matched in results:
         all_matches.extend(data)
         tot += seen
-        has += with_mobile
+        has += matched
 
     print(f"Records scanned: {tot}, with mobile: {has}, matches: {len(all_matches)}")
 
@@ -206,6 +209,6 @@ if __name__=="__main__":
         merge_word()
     write_excel(all_matches)
 
-    print(f"\n→ Word: {OUTPUT_DOCX}")
-    print(f"→ Excel: {OUTPUT_XLSX}")
-    print(f"→ Debug log at {DEBUG_LOG}")
+    shutil.rmtree(TEMP_DIR)
+    print(f"\n→ Word saved to {OUTPUT_DOCX}")
+    print(f"→ Excel saved to {OUTPUT_XLSX}")
