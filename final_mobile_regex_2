@@ -21,12 +21,6 @@ def clean_text(s: str) -> str:
     # strip null bytes
     return s.replace('\x00', '')
 
-def unescape_payload(s: str) -> str:
-    # turn \" into " and \{ } back to braces so regex can see keys
-    s = s.replace('\\"', '"')
-    s = re.sub(r'\\([{}])', r'\1', s)
-    return s
-
 def flatten_json(obj, prefix=""):
     flat = {}
     if isinstance(obj, dict):
@@ -34,13 +28,6 @@ def flatten_json(obj, prefix=""):
             path = f"{prefix}{k}"
             if isinstance(v, (dict, list)):
                 flat.update(flatten_json(v, path + "."))
-            elif isinstance(v, str) and v.strip().startswith(("{", "[")):
-                try:
-                    inner = json.loads(v)
-                except Exception:
-                    flat[path] = v
-                else:
-                    flat.update(flatten_json(inner, path + "."))
             else:
                 flat[path] = v
     elif isinstance(obj, list):
@@ -48,7 +35,7 @@ def flatten_json(obj, prefix=""):
             flat.update(flatten_json(item, f"{prefix}[{i}]."))
     return flat
 
-# === LOAD & GROUP RECORDS ===
+# === LOAD RECORDS ===
 def load_records():
     records = []
     last_id = None
@@ -70,7 +57,7 @@ def chunk_records(records):
     for i in range(0, len(records), CHUNK_SIZE):
         yield records[i:i+CHUNK_SIZE], i//CHUNK_SIZE
 
-# === PROCESS A CHUNK ===
+# === PROCESS ONE CHUNK ===
 def process_chunk(args):
     chunk, idx, result_list = args
     pat = re.compile(MOBILE_REGEX)
@@ -81,12 +68,12 @@ def process_chunk(args):
     for identifier, ts, payload in chunk:
         recs_seen += 1
         payload = clean_text(payload)
-        hits = list(pat.finditer(payload))
-        if not hits:
+        mobiles = list(pat.finditer(payload))
+        if not mobiles:
             continue
         recs_with_mobile += 1
 
-        # attempt JSON flatten
+        # attempt parse & flatten well-formed JSON
         flat = {}
         try:
             obj = json.loads(payload)
@@ -94,15 +81,18 @@ def process_chunk(args):
         except json.JSONDecodeError:
             pass
 
-        # prepare unescaped version for fallback
-        raw = unescape_payload(payload)
+        # prepare a version with escaped JSON strings decoded
+        try:
+            raw = payload.encode('utf-8').decode('unicode_escape')
+        except:
+            raw = payload
 
         # build Word paragraph
         para = doc.add_paragraph(f"{identifier} | CreateTime:{ts} | ")
         last = 0
         fields = []
 
-        for m in hits:
+        for m in mobiles:
             s, e = m.span()
             if s > last:
                 para.add_run(payload[last:s])
@@ -111,9 +101,10 @@ def process_chunk(args):
             run.font.color.rgb = RGBColor(255, 0, 0)
             last = e
 
-            # lookup field via flattened JSON
-            field = next((k for k, v in flat.items() if str(v) == number), "")
-            # fallback: generic regex on unescaped text
+            # 1) lookup in flattened JSON
+            field = next((k for k,v in flat.items() if str(v) == number), "")
+
+            # 2) fallback: generic regex on raw text
             if not field:
                 fm = re.search(r'"([^"]+)"\s*:\s*' + re.escape(number), raw)
                 if fm:
@@ -125,7 +116,7 @@ def process_chunk(args):
         if last < len(payload):
             para.add_run(payload[last:])
 
-        # append fields
+        # append fields in red
         para.add_run(" | field: ")
         for i, fld in enumerate(fields):
             if i:
@@ -133,7 +124,7 @@ def process_chunk(args):
             fr = para.add_run(fld)
             fr.font.color.rgb = RGBColor(255, 0, 0)
 
-    # save chunk docx if we found matches
+    # save Word chunk if matches found
     if matches_data:
         os.makedirs(TEMP_DIR, exist_ok=True)
         doc.save(os.path.join(TEMP_DIR, f"chunk_{idx}.docx"))
@@ -144,48 +135,45 @@ def process_chunk(args):
 def merge_word():
     merged = Document()
     for fn in tqdm(sorted(os.listdir(TEMP_DIR)), desc="Merging Word"):
-        if not fn.endswith(".docx"):
-            continue
+        if not fn.endswith(".docx"): continue
         sub = Document(os.path.join(TEMP_DIR, fn))
         for para in sub.paragraphs:
-            out = merged.add_paragraph()
+            out_p = merged.add_paragraph()
             for run in para.runs:
-                nr = out.add_run(run.text)
+                nr = out_p.add_run(run.text)
                 if run.font.color and run.font.color.rgb:
                     nr.font.color.rgb = run.font.color.rgb
-                nr.bold = run.bold
-                nr.italic = run.italic
-                nr.underline = run.underline
+                nr.bold = run.bold; nr.italic = run.italic; nr.underline = run.underline
     merged.save(OUTPUT_DOCX)
 
 # === WRITE EXCEL ===
 def write_excel(all_matches):
     wb = xlsxwriter.Workbook(OUTPUT_XLSX)
     ws = wb.add_worksheet()
-    red = wb.add_format({'font_color': 'red'})
-    ws.write_row(0, 0, ["Identifier", "Timestamp", "Payload", "Mobile", "Field"])
+    red = wb.add_format({'font_color':'red'})
+    ws.write_row(0, 0, ["Identifier","Timestamp","Payload","Mobile","Field"])
     row = 1
-    for ident, ts, payload, number, field in all_matches:
-        ws.write(row, 0, ident)
+    for identifier, ts, payload, mobile, field in all_matches:
+        ws.write(row, 0, identifier)
         ws.write(row, 1, ts)
         ws.write(row, 2, payload)
-        ws.write(row, 3, number, red)
+        ws.write(row, 3, mobile, red)
         ws.write(row, 4, field)
         row += 1
     wb.close()
 
 # === MAIN ===
-if __name__ == "__main__":
+if __name__=="__main__":
     if os.path.isdir(TEMP_DIR):
         shutil.rmtree(TEMP_DIR)
 
-    print("=== MOBILE EXTRACTOR (Generic Field-Fallback) ===")
+    print("=== MOBILE EXTRACTOR (Nested Payload Support) ===")
     records = load_records()
     print(f"Total records found: {len(records)}")
     chunks = list(chunk_records(records))
 
-    manager = Manager()
-    results = manager.list()
+    mgr = Manager()
+    results = mgr.list()
     with Pool(min(cpu_count(), len(chunks))) as pool:
         list(tqdm(pool.imap_unordered(
             process_chunk,
@@ -194,10 +182,10 @@ if __name__ == "__main__":
 
     all_matches = []
     tot = has = 0
-    for data, recs, with_mobile in results:
+    for data, recs, matched in results:
         all_matches.extend(data)
         tot += recs
-        has += with_mobile
+        has += matched
 
     print(f"Records scanned: {tot}, with mobile: {has}, matches: {len(all_matches)}")
 
