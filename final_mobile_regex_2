@@ -16,39 +16,8 @@ OUTPUT_DOCX  = "final_output_mobile.docx"
 OUTPUT_XLSX  = "final_output_mobile.xlsx"
 TEMP_DIR     = "temp_parts"
 
-# === FLATTEN JSON ===
-def flatten_json(obj, prefix=""):
-    """
-    Recursively flatten dicts/lists and parse JSON strings.
-    Returns a dict mapping each 'path' to its value.
-    """
-    result = {}
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            path = f"{prefix}{k}"
-            if isinstance(v, dict) or isinstance(v, list):
-                result.update(flatten_json(v, path + "."))
-            elif isinstance(v, str) and v.strip().startswith(("{", "[")):
-                # attempt to parse JSON inside strings
-                try:
-                    inner = json.loads(v)
-                except Exception:
-                    result[path] = v
-                else:
-                    result.update(flatten_json(inner, path + "."))
-            else:
-                result[path] = v
-    elif isinstance(obj, list):
-        for idx, item in enumerate(obj):
-            result.update(flatten_json(item, f"{prefix}[{idx}]."))
-    return result
-
 # === LOAD RECORDS ===
 def load_records():
-    """
-    Reads INPUT_FILE and returns list of (identifier, timestamp, payload)
-    by pairing each CreateTime line with the most recent identifier.
-    """
     records = []
     last_id = None
     ct_re = re.compile(r"^CreateTime:(\d+)\s+(.*)$")
@@ -56,7 +25,7 @@ def load_records():
         for raw in f:
             line = raw.rstrip('\r\n')
             m = ct_re.match(line)
-            if m and last_id is not None:
+            if m and last_id:
                 records.append((last_id, m.group(1), m.group(2)))
             elif line.strip():
                 last_id = line.strip()
@@ -70,31 +39,43 @@ def chunk_records(records):
 # === PROCESS ONE CHUNK ===
 def process_chunk(args):
     chunk, idx, result_list = args
-    pattern = re.compile(MOBILE_REGEX, re.IGNORECASE)
-
+    pattern = re.compile(MOBILE_REGEX)
     doc = Document()
     matches_data = []
     recs_seen = recs_with_mobile = 0
 
     for identifier, ts, payload in chunk:
         recs_seen += 1
-        mlist = list(pattern.finditer(payload))
-        if not mlist:
+        mobiles = list(pattern.finditer(payload))
+        if not mobiles:
             continue
         recs_with_mobile += 1
 
-        # parse and flatten JSON
+        # try parse JSON and flatten
+        flat = {}
         try:
             obj = json.loads(payload)
+            def recurse(o, path=""):
+                if isinstance(o, dict):
+                    for k, v in o.items():
+                        newp = f"{path}{k}"
+                        if isinstance(v, (dict, list)):
+                            recurse(v, newp + ".")
+                        else:
+                            flat[newp] = v
+                elif isinstance(o, list):
+                    for i, item in enumerate(o):
+                        recurse(item, f"{path}[{i}].")
+                # ignore other types
+            recurse(obj)
         except json.JSONDecodeError:
-            obj = {}
-        flat = flatten_json(obj)
+            pass
 
         # build Word paragraph
         para = doc.add_paragraph(f"{identifier} | CreateTime:{ts} | ")
         last = 0
         fields = []
-        for mt in mlist:
+        for mt in mobiles:
             s, e = mt.span()
             if s > last:
                 para.add_run(payload[last:s])
@@ -103,21 +84,25 @@ def process_chunk(args):
             run.font.color.rgb = RGBColor(255, 0, 0)
             last = e
 
-            # find field name
+            # find field via flat map
             field = ""
             for path, val in flat.items():
                 if str(val) == mobile:
                     field = path
                     break
-            fields.append(field)
+            # fallback: regex on raw payload
+            if not field:
+                fm = re.search(r'"([^"]+)"\s*:\s*' + re.escape(mobile), payload)
+                if fm:
+                    field = fm.group(1)
 
-            # record for Excel
+            fields.append(field)
             matches_data.append((identifier, ts, payload, mobile, field))
 
         if last < len(payload):
             para.add_run(payload[last:])
 
-        # append field names in red
+        # append fields in red
         para.add_run(" | field: ")
         for i, fld in enumerate(fields):
             if i:
@@ -125,7 +110,7 @@ def process_chunk(args):
             fr = para.add_run(fld)
             fr.font.color.rgb = RGBColor(255, 0, 0)
 
-    # save Word chunk if any matches
+    # save Word chunk if matches
     if matches_data:
         os.makedirs(TEMP_DIR, exist_ok=True)
         doc.save(os.path.join(TEMP_DIR, f"chunk_{idx}.docx"))
@@ -140,14 +125,12 @@ def merge_word():
             continue
         doc = Document(os.path.join(TEMP_DIR, fn))
         for para in doc.paragraphs:
-            out_p = merged.add_paragraph()
+            np = merged.add_paragraph()
             for run in para.runs:
-                nr = out_p.add_run(run.text)
+                nr = np.add_run(run.text)
                 if run.font.color and run.font.color.rgb:
                     nr.font.color.rgb = run.font.color.rgb
-                nr.bold = run.bold
-                nr.italic = run.italic
-                nr.underline = run.underline
+                nr.bold = run.bold; nr.italic = run.italic; nr.underline = run.underline
     merged.save(OUTPUT_DOCX)
 
 # === WRITE EXCEL ===
@@ -156,8 +139,7 @@ def write_excel(all_matches):
     ws = wb.add_worksheet()
     red = wb.add_format({'font_color': 'red'})
 
-    # header
-    ws.write_row(0, 0, ["Identifier", "Timestamp", "Payload", "Mobile", "Field"])
+    ws.write_row(0, 0, ["Identifier","Timestamp","Payload","Mobile","Field"])
     row = 1
     for identifier, ts, payload, mobile, field in all_matches:
         ws.write(row, 0, identifier)
@@ -170,7 +152,6 @@ def write_excel(all_matches):
 
 # === MAIN ===
 if __name__ == "__main__":
-    # cleanup
     if os.path.isdir(TEMP_DIR):
         shutil.rmtree(TEMP_DIR)
 
